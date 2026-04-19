@@ -23,6 +23,20 @@ class TransactionsNotifier extends AsyncNotifier<List<Transaction>> {
     return repo.getAllTransactions();
   }
 
+  /// Apply per-account balance deltas after a transaction commit. Each call
+  /// goes through [AccountsNotifier.updateBalance], which serializes per
+  /// account and updates both the database row and the in-memory provider
+  /// state. Runs sequentially so the per-account locks chain cleanly.
+  ///
+  /// On failure, the transaction-table commit has already succeeded, so the
+  /// caller should surface a loud error and prompt the user to refresh.
+  Future<void> _applyBalanceDeltas(Map<String, double> deltas) async {
+    final accountsNotifier = ref.read(accountsProvider.notifier);
+    for (final entry in deltas.entries) {
+      await accountsNotifier.updateBalance(entry.key, entry.value);
+    }
+  }
+
   Future<Transaction> addTransaction({
     required double amount,
     required TransactionType type,
@@ -102,18 +116,15 @@ class TransactionsNotifier extends AsyncNotifier<List<Transaction>> {
       }
     }
 
-    // Wrap in database transaction to prevent locking issues
+    // Persist the transaction row first, then sync account balances. Keeping
+    // balance updates outside the drift transaction avoids nesting per-account
+    // locks inside drift's write zone and keeps in-memory state in sync.
     await db.transaction(() async {
-      // Save to encrypted database
       await repo.createTransaction(transaction);
-
-      // Update account balances
-      for (final entry in transactionDeltas(transaction).entries) {
-        await ref.read(accountsProvider.notifier).updateBalance(entry.key, entry.value);
-      }
     });
 
-    // Update local state
+    await _applyBalanceDeltas(transactionDeltas(transaction));
+
     state = state.whenData((transactions) => [transaction, ...transactions]);
 
     return transaction;
@@ -166,23 +177,25 @@ class TransactionsNotifier extends AsyncNotifier<List<Transaction>> {
       }
     }
 
-    // Wrap in database transaction to prevent locking issues
+    // Combine reverse + forward deltas so each account is touched once after
+    // commit, minimizing the in-flight window where DB and balance state
+    // could disagree.
+    final combinedDeltas = <String, double>{};
+    for (final entry in reverseTransactionDeltas(originalTransaction).entries) {
+      combinedDeltas.update(entry.key, (v) => v + entry.value,
+          ifAbsent: () => entry.value);
+    }
+    for (final entry in transactionDeltas(transaction).entries) {
+      combinedDeltas.update(entry.key, (v) => v + entry.value,
+          ifAbsent: () => entry.value);
+    }
+
     await db.transaction(() async {
-      // Reverse original balance effects
-      for (final entry in reverseTransactionDeltas(originalTransaction).entries) {
-        await ref.read(accountsProvider.notifier).updateBalance(entry.key, entry.value);
-      }
-
-      // Apply new balance effects
-      for (final entry in transactionDeltas(transaction).entries) {
-        await ref.read(accountsProvider.notifier).updateBalance(entry.key, entry.value);
-      }
-
-      // Update in encrypted database
       await repo.updateTransaction(transaction);
     });
 
-    // Update local state
+    await _applyBalanceDeltas(combinedDeltas);
+
     state = state.whenData(
       (transactions) =>
           transactions.map((t) => t.id == transaction.id ? transaction : t).toList(),
@@ -205,22 +218,17 @@ class TransactionsNotifier extends AsyncNotifier<List<Transaction>> {
     }
     final transaction = currentState[deleteIndex];
 
-    // Wrap in database transaction to prevent locking issues
+    // Drift transaction covers transaction-row delete plus attachment/tag
+    // cleanup (both repos share the same drift database, so they enlist in
+    // the zone). Balance updates run after commit through the locked path.
     await db.transaction(() async {
-      // Soft delete in database
       await repo.deleteTransaction(id);
-
-      // Clean up related attachments and tag associations
       await ref.read(attachmentRepositoryProvider).deleteAttachmentsForTransaction(id);
       await ref.read(tagRepositoryProvider).removeTagsForTransaction(id);
-
-      // Reverse the balance change
-      for (final entry in reverseTransactionDeltas(transaction).entries) {
-        await ref.read(accountsProvider.notifier).updateBalance(entry.key, entry.value);
-      }
     });
 
-    // Update local state
+    await _applyBalanceDeltas(reverseTransactionDeltas(transaction));
+
     state = state.whenData(
       (transactions) => transactions.where((t) => t.id != id).toList(),
     );
@@ -253,16 +261,11 @@ class TransactionsNotifier extends AsyncNotifier<List<Transaction>> {
     }
 
     await db.transaction(() async {
-      // Restore in database
       await repo.restoreTransaction(transaction.id);
-
-      // Re-apply the balance change to the account
-      for (final entry in transactionDeltas(transaction).entries) {
-        await ref.read(accountsProvider.notifier).updateBalance(entry.key, entry.value);
-      }
     });
 
-    // Re-insert into local state (sorted by date descending)
+    await _applyBalanceDeltas(transactionDeltas(transaction));
+
     state = state.whenData((transactions) {
       final updated = [transaction, ...transactions];
       updated.sort((a, b) => b.date.compareTo(a.date));
@@ -282,25 +285,34 @@ class TransactionsNotifier extends AsyncNotifier<List<Transaction>> {
       throw RepositoryException.fetch(entityType: 'Transaction');
     }
 
+    // Resolve transactions up front so we can compute combined deltas, and so
+    // a missing id fails before any DB write.
+    final toDelete = <Transaction>[];
+    for (final id in ids) {
+      final batchIndex = currentState.indexWhere((t) => t.id == id);
+      if (batchIndex == -1) {
+        throw EntityNotFoundException(entityType: 'Transaction', entityId: id);
+      }
+      toDelete.add(currentState[batchIndex]);
+    }
+
+    final combinedDeltas = <String, double>{};
+    for (final tx in toDelete) {
+      for (final entry in reverseTransactionDeltas(tx).entries) {
+        combinedDeltas.update(entry.key, (v) => v + entry.value,
+            ifAbsent: () => entry.value);
+      }
+    }
+
     await db.transaction(() async {
-      for (final id in ids) {
-        final batchIndex = currentState.indexWhere((t) => t.id == id);
-        if (batchIndex == -1) {
-          throw EntityNotFoundException(entityType: 'Transaction', entityId: id);
-        }
-        final transaction = currentState[batchIndex];
-        await repo.deleteTransaction(id);
-
-        // Clean up related attachments and tag associations
-        await ref.read(attachmentRepositoryProvider).deleteAttachmentsForTransaction(id);
-        await ref.read(tagRepositoryProvider).removeTagsForTransaction(id);
-
-        // Reverse the balance change
-        for (final entry in reverseTransactionDeltas(transaction).entries) {
-          await ref.read(accountsProvider.notifier).updateBalance(entry.key, entry.value);
-        }
+      for (final tx in toDelete) {
+        await repo.deleteTransaction(tx.id);
+        await ref.read(attachmentRepositoryProvider).deleteAttachmentsForTransaction(tx.id);
+        await ref.read(tagRepositoryProvider).removeTagsForTransaction(tx.id);
       }
     });
+
+    await _applyBalanceDeltas(combinedDeltas);
 
     // Update local state
     final idSet = ids.toSet();
@@ -337,16 +349,21 @@ class TransactionsNotifier extends AsyncNotifier<List<Transaction>> {
       }
     }
 
+    final combinedDeltas = <String, double>{};
+    for (final tx in transactionsToRestore) {
+      for (final entry in transactionDeltas(tx).entries) {
+        combinedDeltas.update(entry.key, (v) => v + entry.value,
+            ifAbsent: () => entry.value);
+      }
+    }
+
     await db.transaction(() async {
       for (final transaction in transactionsToRestore) {
         await repo.restoreTransaction(transaction.id);
-
-        // Re-apply the balance change
-        for (final entry in transactionDeltas(transaction).entries) {
-          await ref.read(accountsProvider.notifier).updateBalance(entry.key, entry.value);
-        }
       }
     });
+
+    await _applyBalanceDeltas(combinedDeltas);
 
     // Re-insert into local state
     state = state.whenData((transactions) {
@@ -445,19 +462,18 @@ class TransactionsNotifier extends AsyncNotifier<List<Transaction>> {
       }
     }
 
-    // Wrap in database transaction to prevent locking issues
     await db.transaction(() async {
-      // Update transactions in database
       for (final tx in updatedTransactions) {
         await repo.updateTransaction(tx);
       }
-
-      // Update account balances:
-      // Remove the effect from source account (reverse it)
-      await ref.read(accountsProvider.notifier).updateBalance(fromAccountId, -sourceEffect);
-      // Add the effect to target account
-      await ref.read(accountsProvider.notifier).updateBalance(toAccountId, destEffect);
     });
+
+    final moveDeltas = <String, double>{};
+    moveDeltas.update(fromAccountId, (v) => v - sourceEffect,
+        ifAbsent: () => -sourceEffect);
+    moveDeltas.update(toAccountId, (v) => v + destEffect,
+        ifAbsent: () => destEffect);
+    await _applyBalanceDeltas(moveDeltas);
 
     // Update local state for transactions
     final updatedMap = {for (final tx in updatedTransactions) tx.id: tx};
@@ -484,33 +500,38 @@ class TransactionsNotifier extends AsyncNotifier<List<Transaction>> {
       (t) => t.destinationAccountId == accountId && t.accountId != accountId,
     ).toList();
 
-    // Wrap in database transaction to prevent locking issues
+    // Compute deltas for accounts *other than* the one being deleted. The
+    // account itself is presumed to be removed by the caller, so its own
+    // balance does not need reversing.
+    final combinedDeltas = <String, double>{};
+    for (final tx in sourceTransactions) {
+      if (tx.type == TransactionType.transfer &&
+          tx.destinationAccountId != null &&
+          tx.destinationAccountId != accountId) {
+        final delta = -(tx.destinationAmount ?? tx.amount);
+        combinedDeltas.update(tx.destinationAccountId!, (v) => v + delta,
+            ifAbsent: () => delta);
+      }
+    }
+    for (final tx in destTransactions) {
+      combinedDeltas.update(tx.accountId, (v) => v + tx.amount,
+          ifAbsent: () => tx.amount);
+    }
+
     await db.transaction(() async {
-      // Delete source transactions and reverse their balance effects
       for (final tx in sourceTransactions) {
         await repo.deleteTransaction(tx.id);
         await ref.read(attachmentRepositoryProvider).deleteAttachmentsForTransaction(tx.id);
         await ref.read(tagRepositoryProvider).removeTagsForTransaction(tx.id);
-
-        // Reverse the balance change on linked accounts
-        if (tx.type == TransactionType.transfer && tx.destinationAccountId != null &&
-            tx.destinationAccountId != accountId) {
-          // This account is source of a transfer — reverse the credit on destination
-          await ref.read(accountsProvider.notifier).updateBalance(
-                tx.destinationAccountId!, -(tx.destinationAmount ?? tx.amount));
-        }
       }
-
-      // For transfers where this account is the destination, reverse the debit on source and soft-delete
       for (final tx in destTransactions) {
-        // Reverse the debit from source account (transfer debits source by tx.amount)
-        await ref.read(accountsProvider.notifier).updateBalance(
-              tx.accountId, tx.amount);
         await repo.deleteTransaction(tx.id);
         await ref.read(attachmentRepositoryProvider).deleteAttachmentsForTransaction(tx.id);
         await ref.read(tagRepositoryProvider).removeTagsForTransaction(tx.id);
       }
     });
+
+    await _applyBalanceDeltas(combinedDeltas);
 
     // Update local state — remove transactions where this account is source or destination
     final destIds = destTransactions.map((t) => t.id).toSet();
@@ -565,20 +586,23 @@ class TransactionsNotifier extends AsyncNotifier<List<Transaction>> {
 
     final transactionsToDelete = currentState.where((t) => t.categoryId == categoryId).toList();
 
-    // Wrap in database transaction to prevent locking issues
+    final combinedDeltas = <String, double>{};
+    for (final tx in transactionsToDelete) {
+      for (final entry in reverseTransactionDeltas(tx).entries) {
+        combinedDeltas.update(entry.key, (v) => v + entry.value,
+            ifAbsent: () => entry.value);
+      }
+    }
+
     await db.transaction(() async {
-      // Delete each transaction and reverse its balance effect
       for (final tx in transactionsToDelete) {
         await repo.deleteTransaction(tx.id);
         await ref.read(attachmentRepositoryProvider).deleteAttachmentsForTransaction(tx.id);
         await ref.read(tagRepositoryProvider).removeTagsForTransaction(tx.id);
-
-        // Reverse the balance change
-        for (final entry in reverseTransactionDeltas(tx).entries) {
-          await ref.read(accountsProvider.notifier).updateBalance(entry.key, entry.value);
-        }
       }
     });
+
+    await _applyBalanceDeltas(combinedDeltas);
 
     // Update local state
     state = state.whenData(

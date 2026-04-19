@@ -1,5 +1,6 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../../../core/providers/database_providers.dart';
 import '../../data/models/advanced_transaction_filter.dart';
 import '../../data/models/transaction.dart';
 import 'transactions_provider.dart';
@@ -141,16 +142,26 @@ final groupedTransactionsProvider = Provider<AsyncValue<List<TransactionGroup>>>
   });
 });
 
-final recentTransactionsProvider = Provider<AsyncValue<List<Transaction>>>((ref) {
+/// Five most recent transactions for the home dashboard.
+///
+/// Prefers the in-memory transactions list when it has already loaded —
+/// that's the steady-state path and avoids redundant DB work. On cold start,
+/// when [transactionsProvider] hasn't resolved yet, falls back to a paged
+/// DB fetch so the home screen can paint without waiting for the full list.
+final recentTransactionsProvider =
+    FutureProvider<List<Transaction>>((ref) async {
   final transactionsAsync = ref.watch(transactionsProvider);
-
-  return transactionsAsync.whenData((transactions) {
-    // Sort by date descending and take first 5
-    final sorted = List<Transaction>.from(transactions)
+  final loaded = transactionsAsync.valueOrNull;
+  if (loaded != null) {
+    final sorted = List<Transaction>.from(loaded)
       ..sort((a, b) => b.date.compareTo(a.date));
-
     return sorted.take(5).toList();
-  });
+  }
+  if (transactionsAsync.hasError) {
+    throw transactionsAsync.error!;
+  }
+  final repo = ref.watch(transactionRepositoryProvider);
+  return repo.getTransactionsPaged(limit: 5);
 });
 
 final transactionDateBoundsProvider = Provider<({DateTime? earliest, DateTime? latest})>((ref) {

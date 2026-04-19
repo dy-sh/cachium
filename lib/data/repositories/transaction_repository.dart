@@ -272,6 +272,26 @@ class TransactionRepository with CorruptionTracker {
     }
   }
 
+  /// Fetch a single transaction by id, decrypted. Returns null if no row
+  /// exists or if the row is soft-deleted.
+  ///
+  /// Use this from edit-mode init paths where you only need one row and
+  /// don't want to force a full transactions list load just to look up an id.
+  ///
+  /// Throws [RepositoryException] if fetch or decryption fails.
+  Future<ui.Transaction?> getTransactionById(String id) async {
+    try {
+      final row = await database.getTransaction(id);
+      if (row == null) return null;
+      final result = await _decryptRows([row]);
+      updateCorruptedCount(result.corruptedCount);
+      return result.entities.isEmpty ? null : result.entities.first;
+    } catch (e) {
+      if (e is RepositoryException) rethrow;
+      throw RepositoryException.fetch(entityType: _entityType, cause: e);
+    }
+  }
+
   /// Get all soft-deleted transactions
   ///
   /// Throws [RepositoryException] if fetch or decryption fails.

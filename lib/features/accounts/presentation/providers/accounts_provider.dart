@@ -10,12 +10,9 @@ import '../../../../core/providers/database_providers.dart';
 import '../../../../core/providers/exchange_rate_provider.dart';
 import '../../../../core/providers/optimistic_notifier.dart';
 import '../../../settings/presentation/providers/settings_provider.dart';
-import '../../../transactions/data/models/transaction.dart';
-import '../../../savings_goals/presentation/providers/savings_goals_provider.dart';
-import '../../../transactions/presentation/providers/recurring_rules_provider.dart';
-import '../../../transactions/presentation/providers/transaction_templates_provider.dart';
 import '../../../transactions/presentation/providers/transactions_provider.dart';
 import '../../data/models/account.dart';
+import '../../data/services/account_deletion_service.dart';
 
 /// Notifier for managing account state.
 ///
@@ -26,6 +23,10 @@ import '../../data/models/account.dart';
 class AccountsNotifier extends AsyncNotifier<List<Account>>
     with OptimisticAsyncNotifier<Account> {
   final _uuid = const Uuid();
+  /// Per-account chain of pending balance updates. Each new caller awaits the
+  /// previous future, then installs its own. Entries are intentionally not
+  /// removed: account-id cardinality is bounded, and awaiting an already-
+  /// completed future is a no-op so stale entries cost nothing.
   final Map<String, Future<void>> _balanceLocks = {};
 
   @override
@@ -89,94 +90,35 @@ class AccountsNotifier extends AsyncNotifier<List<Account>>
     );
   }
 
-  /// Delete account along with all its transactions (in a single transaction)
-  ///
-  /// Handles both outgoing transactions (accountId == deletedAccount) and
-  /// incoming transfers (destinationAccountId == deletedAccount).
+  /// Delete account along with all its transactions (cascading to recurring
+  /// rules, templates, savings goals). Delegates to [AccountDeletionService].
   ///
   /// Throws [RepositoryException] on failure.
   Future<void> deleteAccountWithTransactions(String accountId) async {
     final previousState = state;
-
     try {
-      final db = ref.read(databaseProvider);
-      final accountRepo = ref.read(accountRepositoryProvider);
-      final transactionRepo = ref.read(transactionRepositoryProvider);
-
-      // Await loaded state to avoid silently skipping related data
-      final allTransactions = await ref.read(transactionsProvider.future);
-      final outgoingTransactions =
-          allTransactions.where((t) => t.accountId == accountId).toList();
-      final incomingTransfers = allTransactions.where(
-        (t) => t.destinationAccountId == accountId && t.accountId != accountId,
-      ).toList();
-
-      // Await related provider state before entering transaction
-      final rules = await ref.read(recurringRulesProvider.future);
-      final templates = await ref.read(transactionTemplatesProvider.future);
-
-      // Optimistically update local state
+      // Optimistically update local state.
       state = state.whenData(
         (accounts) => accounts.where((a) => a.id != accountId).toList(),
       );
-
-      // Wrap in transaction to prevent locking
-      await db.transaction(() async {
-        // Delete outgoing transactions and reverse balance on linked accounts
-        for (final tx in outgoingTransactions) {
-          await transactionRepo.deleteTransaction(tx.id);
-          // If this was a transfer to another account, reverse the credit
-          if (tx.type == TransactionType.transfer &&
-              tx.destinationAccountId != null &&
-              tx.destinationAccountId != accountId) {
-            await ref.read(accountsProvider.notifier).updateBalance(
-                  tx.destinationAccountId!, -(tx.destinationAmount ?? tx.amount));
-          }
-        }
-
-        // Handle incoming transfers: reverse the debit on source accounts and soft-delete
-        for (final tx in incomingTransfers) {
-          await ref.read(accountsProvider.notifier).updateBalance(
-                tx.accountId, tx.amount);
-          await transactionRepo.deleteTransaction(tx.id);
-        }
-
-        // Clean up recurring rules referencing this account
-        for (final rule in rules) {
-          if (rule.accountId == accountId || rule.destinationAccountId == accountId) {
-            await ref.read(recurringRulesProvider.notifier).deleteRule(rule.id);
-          }
-        }
-
-        // Clean up transaction templates referencing this account
-        for (final template in templates) {
-          if (template.accountId == accountId || template.destinationAccountId == accountId) {
-            await ref.read(transactionTemplatesProvider.notifier).deleteTemplate(template.id);
-          }
-        }
-
-        // Clear linkedAccountId on savings goals referencing this account
-        await _clearLinkedAccountOnGoals(accountId);
-
-        // Delete the account
-        await accountRepo.deleteAccount(accountId);
-      });
-
-      // Refresh dependent providers after successful operation
+      await ref
+          .read(accountDeletionServiceProvider)
+          .deleteAccountWithTransactions(accountId);
       ref.invalidate(transactionsProvider);
     } catch (e, st) {
       state = previousState;
       Error.throwWithStackTrace(
-        e is AppException ? e : RepositoryException.delete(entityType: 'Account', entityId: accountId, cause: e),
+        e is AppException
+            ? e
+            : RepositoryException.delete(
+                entityType: 'Account', entityId: accountId, cause: e),
         st,
       );
     }
   }
 
-  /// Move all transactions to another account then delete the source account
-  ///
-  /// Handles both outgoing transactions (accountId == source) and
-  /// incoming transfers (destinationAccountId == source).
+  /// Move all transactions from [sourceAccountId] to [targetAccountId], then
+  /// delete the source. Delegates to [AccountDeletionService].
   ///
   /// Throws [RepositoryException] on failure.
   Future<void> deleteAccountMovingTransactions(
@@ -184,13 +126,7 @@ class AccountsNotifier extends AsyncNotifier<List<Account>>
     String targetAccountId,
   ) async {
     final previousState = state;
-
     try {
-      final db = ref.read(databaseProvider);
-      final accountRepo = ref.read(accountRepositoryProvider);
-      final transactionRepo = ref.read(transactionRepositoryProvider);
-
-      // Get current state
       final accounts = state.valueOrNull;
       if (accounts == null) return;
 
@@ -204,30 +140,15 @@ class AccountsNotifier extends AsyncNotifier<List<Account>>
         );
       }
 
-      // Await loaded state to avoid silently skipping related data
-      final allTransactions = await ref.read(transactionsProvider.future);
-      final transactionsToMove =
-          allTransactions.where((t) => t.accountId == sourceAccountId).toList();
-      final incomingTransfers = allTransactions.where(
-        (t) => t.destinationAccountId == sourceAccountId && t.accountId != sourceAccountId,
-      ).toList();
+      final totalEffect = await ref
+          .read(accountDeletionServiceProvider)
+          .moveAndDelete(
+            sourceAccountId: sourceAccountId,
+            targetAccountId: targetAccountId,
+            targetAccount: targetAccount,
+          );
 
-      // Calculate balance effect correctly
-      double totalEffect = 0;
-      for (final tx in transactionsToMove) {
-        if (tx.type == TransactionType.transfer) {
-          // Transfer debits source by tx.amount
-          totalEffect -= tx.amount;
-        } else {
-          totalEffect += tx.type == TransactionType.income ? tx.amount : -tx.amount;
-        }
-      }
-      // Incoming transfers credit the source account
-      for (final tx in incomingTransfers) {
-        totalEffect += tx.destinationAmount ?? tx.amount;
-      }
-
-      // Optimistically update local state
+      // Reflect the move in local state.
       state = state.whenData((accts) {
         return accts
             .where((a) => a.id != sourceAccountId)
@@ -237,64 +158,14 @@ class AccountsNotifier extends AsyncNotifier<List<Account>>
             .toList();
       });
 
-      // Await related provider state before entering transaction
-      final rules = await ref.read(recurringRulesProvider.future);
-      final templates = await ref.read(transactionTemplatesProvider.future);
-
-      // Wrap in transaction to prevent locking
-      await db.transaction(() async {
-        // Update outgoing transactions to point to target account
-        for (final tx in transactionsToMove) {
-          final updatedTx = tx.copyWith(accountId: targetAccountId);
-          await transactionRepo.updateTransaction(updatedTx);
-        }
-
-        // Update incoming transfers to point to target account as destination
-        for (final tx in incomingTransfers) {
-          final updatedTx = tx.copyWith(destinationAccountId: targetAccountId);
-          await transactionRepo.updateTransaction(updatedTx);
-        }
-
-        // Update recurring rules referencing this account
-        for (final rule in rules) {
-          if (rule.accountId == sourceAccountId) {
-            await ref.read(recurringRulesProvider.notifier).updateRule(
-                  rule.copyWith(accountId: targetAccountId));
-          } else if (rule.destinationAccountId == sourceAccountId) {
-            await ref.read(recurringRulesProvider.notifier).updateRule(
-                  rule.copyWith(destinationAccountId: targetAccountId));
-          }
-        }
-
-        // Update transaction templates referencing this account
-        for (final template in templates) {
-          if (template.accountId == sourceAccountId) {
-            await ref.read(transactionTemplatesProvider.notifier).updateTemplate(
-                  template.copyWith(accountId: targetAccountId));
-          } else if (template.destinationAccountId == sourceAccountId) {
-            await ref.read(transactionTemplatesProvider.notifier).updateTemplate(
-                  template.copyWith(destinationAccountId: targetAccountId));
-          }
-        }
-
-        // Update target account balance
-        final updatedTarget =
-            targetAccount.copyWith(balance: targetAccount.balance + totalEffect);
-        await accountRepo.updateAccount(updatedTarget);
-
-        // Clear linkedAccountId on savings goals referencing the source account
-        await _clearLinkedAccountOnGoals(sourceAccountId);
-
-        // Delete the source account
-        await accountRepo.deleteAccount(sourceAccountId);
-      });
-
-      // Refresh dependent providers after successful operation
       ref.invalidate(transactionsProvider);
     } catch (e, st) {
       state = previousState;
       Error.throwWithStackTrace(
-        e is AppException ? e : RepositoryException.delete(entityType: 'Account', entityId: sourceAccountId, cause: e),
+        e is AppException
+            ? e
+            : RepositoryException.delete(
+                entityType: 'Account', entityId: sourceAccountId, cause: e),
         st,
       );
     }
@@ -354,21 +225,6 @@ class AccountsNotifier extends AsyncNotifier<List<Account>>
       );
     } finally {
       completer.complete();
-      if (identical(_balanceLocks[accountId], completer.future)) {
-        // ignore: unawaited_futures
-        _balanceLocks.remove(accountId);
-      }
-    }
-  }
-
-  /// Clear linkedAccountId on savings goals that reference the given account.
-  Future<void> _clearLinkedAccountOnGoals(String accountId) async {
-    final goals = await ref.read(savingsGoalsProvider.future);
-    for (final goal in goals) {
-      if (goal.linkedAccountId == accountId) {
-        await ref.read(savingsGoalsProvider.notifier).updateGoal(
-              goal.copyWith(clearLinkedAccountId: true));
-      }
     }
   }
 

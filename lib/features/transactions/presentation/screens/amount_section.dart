@@ -26,6 +26,7 @@ class AmountSection extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final mainCurrency = ref.watch(mainCurrencyCodeProvider);
     final isStale = ref.watch(exchangeRatesStaleProvider);
+    final rateAge = ref.watch(exchangeRateAgeProvider);
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -62,7 +63,9 @@ class AmountSection extends ConsumerWidget {
                   const Icon(LucideIcons.alertTriangle, size: 14, color: AppColors.yellow),
                   const SizedBox(width: AppSpacing.xs),
                   Text(
-                    'Rates outdated — tap to refresh',
+                    rateAge != null
+                        ? 'Rates outdated ($rateAge) — tap to refresh'
+                        : 'Rates outdated — tap to refresh',
                     style: AppTypography.bodySmall.copyWith(color: AppColors.yellow),
                   ),
                 ],

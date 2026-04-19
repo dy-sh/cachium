@@ -10,6 +10,7 @@ import '../../../../core/constants/app_spacing.dart';
 import '../../../../core/constants/app_typography.dart';
 import '../../../../design_system/components/feedback/notification.dart';
 import '../../../../design_system/components/layout/page_layout.dart';
+import '../../../../design_system/components/layout/unsaved_work_pop_scope.dart';
 import '../../../categories/data/models/category.dart';
 import '../../../settings/data/models/app_settings.dart';
 import '../../../categories/presentation/providers/categories_provider.dart';
@@ -369,6 +370,10 @@ class _BudgetFormSheetState extends ConsumerState<_BudgetFormSheet> {
   bool _showValidationErrors = false;
   bool _isSaving = false;
 
+  String _initialAmountText = '';
+  String? _initialCategoryId;
+  bool _initialRollover = false;
+
   @override
   void initState() {
     super.initState();
@@ -382,6 +387,16 @@ class _BudgetFormSheetState extends ConsumerState<_BudgetFormSheet> {
               .toStringAsFixed(decimals);
       _rolloverEnabled = budget.rolloverEnabled;
     }
+    _initialAmountText = _amountController.text;
+    _initialCategoryId = _selectedCategoryId;
+    _initialRollover = _rolloverEnabled;
+  }
+
+  bool get _hasUnsavedWork {
+    if (_isSaving) return false;
+    return _amountController.text != _initialAmountText ||
+        _selectedCategoryId != _initialCategoryId ||
+        _rolloverEnabled != _initialRollover;
   }
 
   @override
@@ -401,7 +416,9 @@ class _BudgetFormSheetState extends ConsumerState<_BudgetFormSheet> {
             .toList() ??
         [];
 
-    return Container(
+    return UnsavedWorkPopScope(
+      hasUnsavedWork: _hasUnsavedWork,
+      child: Container(
       constraints: BoxConstraints(
         maxHeight: MediaQuery.of(context).size.height * 0.6,
       ),
@@ -589,6 +606,7 @@ class _BudgetFormSheetState extends ConsumerState<_BudgetFormSheet> {
           ],
         ),
       ),
+    ),
     );
   }
 

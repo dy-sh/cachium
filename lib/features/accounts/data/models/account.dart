@@ -106,8 +106,18 @@ class Account {
     required this.createdAt,
     this.sortOrder = 0,
   })  : assert(name.isNotEmpty, 'Account name must not be empty'),
-        assert(currencyCode.length == 3, 'Currency code must be 3 characters'),
+        assert(_isValidCurrencyCode(currencyCode),
+            'Currency code must be 3 uppercase ASCII letters'),
         assert(sortOrder >= 0, 'Sort order must be non-negative');
+
+  static bool _isValidCurrencyCode(String code) {
+    if (code.length != 3) return false;
+    for (var i = 0; i < 3; i++) {
+      final c = code.codeUnitAt(i);
+      if (c < 0x41 || c > 0x5A) return false; // A..Z
+    }
+    return true;
+  }
 
   Color get color => customColor ?? type.color;
   IconData get icon => customIcon ?? type.icon;
@@ -153,8 +163,11 @@ class Account {
     if (name.isEmpty) {
       throw const ValidationException(message: 'Account name must not be empty', field: 'name');
     }
-    if (currencyCode.length != 3) {
-      throw const ValidationException(message: 'Currency code must be 3 characters', field: 'currencyCode');
+    if (!_isValidCurrencyCode(currencyCode)) {
+      throw const ValidationException(
+        message: 'Currency code must be 3 uppercase ASCII letters',
+        field: 'currencyCode',
+      );
     }
     if (sortOrder < 0) {
       throw const ValidationException(message: 'Sort order must be non-negative', field: 'sortOrder');

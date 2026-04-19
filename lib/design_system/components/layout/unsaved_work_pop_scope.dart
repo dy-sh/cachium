@@ -25,6 +25,7 @@ class UnsavedWorkPopScope extends StatelessWidget {
     required bool hasUnsavedWork,
     required VoidCallback navigate,
   }) async {
+    FocusScope.of(context).unfocus();
     if (!hasUnsavedWork) {
       navigate();
       return true;
@@ -49,6 +50,7 @@ class UnsavedWorkPopScope extends StatelessWidget {
     return PopScope(
       canPop: !hasUnsavedWork,
       onPopInvokedWithResult: (didPop, _) async {
+        FocusScope.of(context).unfocus();
         if (didPop) return;
         final shouldDiscard = await showConfirmationDialog(
           context: context,

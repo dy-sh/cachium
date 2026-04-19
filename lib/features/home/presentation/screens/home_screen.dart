@@ -7,6 +7,7 @@ import '../../../../core/constants/app_spacing.dart';
 import '../../../../core/constants/app_typography.dart';
 import '../../../../design_system/components/buttons/circular_button.dart';
 import '../../../../design_system/animations/staggered_list.dart';
+import '../../../../design_system/components/feedback/notification.dart';
 import '../../../../navigation/app_router.dart';
 import '../../../accounts/presentation/providers/accounts_provider.dart';
 import '../../../settings/presentation/providers/settings_provider.dart';
@@ -136,8 +137,10 @@ class HomeScreen extends ConsumerWidget {
                     ref.read(transactionsProvider.notifier).refresh(),
                     ref.read(accountsProvider.notifier).refresh(),
                   ]);
-                } catch (_) {
-                  // Individual providers handle their own error state
+                } catch (e) {
+                  if (context.mounted) {
+                    context.showErrorNotification('Refresh failed: $e');
+                  }
                 }
               },
               child: SingleChildScrollView(

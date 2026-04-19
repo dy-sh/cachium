@@ -161,10 +161,7 @@ double convertTransactionToMainCurrency(
 
 /// Whether exchange rates are stale (>24h old) or missing.
 final exchangeRatesStaleProvider = Provider<bool>((ref) {
-  final settings = ref.watch(settingsProvider).valueOrNull;
-  if (settings == null) return false;
-
-  final lastFetch = settings.lastRateFetchTimestamp;
+  final lastFetch = ref.watch(lastRateFetchTimestampProvider);
   if (lastFetch == null) return true;
 
   final now = DateTime.now().millisecondsSinceEpoch;
@@ -174,10 +171,7 @@ final exchangeRatesStaleProvider = Provider<bool>((ref) {
 /// Human-readable age of the last exchange rate fetch.
 /// Returns null if rates have never been fetched.
 final exchangeRateAgeProvider = Provider<String?>((ref) {
-  final settings = ref.watch(settingsProvider).valueOrNull;
-  if (settings == null) return null;
-
-  final lastFetch = settings.lastRateFetchTimestamp;
+  final lastFetch = ref.watch(lastRateFetchTimestampProvider);
   if (lastFetch == null) return null;
 
   final age = DateTime.now().difference(

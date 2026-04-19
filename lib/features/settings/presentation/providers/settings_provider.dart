@@ -366,6 +366,7 @@ final dateFormatProvider = _setting((s) => s.dateFormat, DateFormatOption.mmddyy
 final mainCurrencyCodeProvider = _setting((s) => s.mainCurrencyCode, 'USD');
 final exchangeRateApiOptionProvider = _setting((s) => s.exchangeRateApiOption, ExchangeRateApiOption.frankfurter);
 final firstDayOfWeekProvider = _setting((s) => s.firstDayOfWeek, FirstDayOfWeek.sunday);
+final lastRateFetchTimestampProvider = _setting<int?>((s) => s.lastRateFetchTimestamp, null);
 
 // Convenience providers — Preferences
 final hapticEnabledProvider = _setting((s) => s.hapticFeedbackEnabled, true);

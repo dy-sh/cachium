@@ -19,6 +19,7 @@ import '../../../accounts/presentation/screens/account_form_screen.dart';
 import '../../../accounts/presentation/providers/accounts_provider.dart';
 import '../../../categories/data/models/category.dart';
 import '../../../settings/presentation/providers/settings_provider.dart';
+import '../../../../core/providers/database_providers.dart';
 import '../../data/models/transaction.dart';
 import '../providers/transaction_form_provider.dart';
 import '../providers/transactions_provider.dart';
@@ -76,10 +77,23 @@ class _TransactionFormScreenState extends ConsumerState<TransactionFormScreen> {
     }
   }
 
-  void _ensureInitialized() {
+  Future<void> _ensureInitialized() async {
     if (widget.transactionId != null) {
-      // Edit mode
-      final transaction = ref.read(transactionByIdProvider(widget.transactionId!));
+      // Edit mode. Prefer the in-memory list if it's already loaded —
+      // otherwise fetch a single row from the encrypted store so cold-start
+      // edit doesn't block on loading thousands of rows.
+      Transaction? transaction =
+          ref.read(transactionByIdProvider(widget.transactionId!));
+      if (transaction == null) {
+        try {
+          transaction = await ref
+              .read(transactionRepositoryProvider)
+              .getTransactionById(widget.transactionId!);
+        } catch (_) {
+          // Fall through — form stays empty, save path will surface the error.
+        }
+      }
+      if (!mounted) return;
       if (transaction != null) {
         ref.read(transactionFormProvider.notifier).initForEdit(transaction);
         _noteController.text = transaction.note ?? '';

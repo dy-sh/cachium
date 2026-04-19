@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:lucide_icons/lucide_icons.dart';
 
+import '../../../core/animations/haptic_helper.dart';
 import '../../../core/constants/app_colors.dart';
 import '../../../core/constants/app_radius.dart';
 import '../../../core/constants/app_spacing.dart';
@@ -64,6 +65,14 @@ class _ConfirmationDialogState extends State<ConfirmationDialog> {
       widget.isDestructive ? AppColors.expense : AppColors.accentPrimary;
 
   void _confirm() {
+    // Stronger feedback for confirmed destructive actions, lighter for
+    // routine confirmations. Matches existing HapticHelper call sites that
+    // fire unconditionally — gating is the OS/device's responsibility.
+    if (widget.isDestructive) {
+      HapticHelper.heavyImpact();
+    } else {
+      HapticHelper.mediumImpact();
+    }
     if (widget.checkboxLabel != null) {
       Navigator.pop(
         context,

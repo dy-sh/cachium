@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:lucide_icons/lucide_icons.dart';
 
+import '../../../core/animations/haptic_helper.dart';
 import '../../../core/constants/app_animations.dart';
 import '../../../core/constants/app_colors.dart';
 import '../../../core/constants/app_radius.dart';
@@ -474,10 +475,12 @@ extension FMNotificationContext on BuildContext {
   }
 
   void showSuccessNotification(String message, {Duration? duration}) {
+    HapticHelper.mediumImpact();
     NotificationOverlay.instance.success(this, message, duration: duration);
   }
 
   void showErrorNotification(String message, {Duration? duration}) {
+    HapticHelper.vibrate();
     NotificationOverlay.instance.error(this, message, duration: duration);
   }
 
